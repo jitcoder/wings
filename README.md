@@ -4,6 +4,17 @@
 ![GitHub Releases](https://img.shields.io/github/downloads/pterodactyl/wings/latest/total)
 [![Go Report Card](https://goreportcard.com/badge/github.com/pterodactyl/wings)](https://goreportcard.com/report/github.com/pterodactyl/wings)
 
+# Dirty Patched Wings
+Allows wings to actually allow docker containers on host network stack
+
+update the following in your config.yml
+```yaml
+driver: host
+network_mode: host
+userns_mode: host
+```
+
+
 # Pterodactyl Wings
 
 Wings is Pterodactyl's server control plane, built for the rapidly changing gaming industry and designed to be
