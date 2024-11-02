@@ -72,6 +72,11 @@ func ConfigureDocker(ctx context.Context) error {
 // Creates a new network on the machine if one does not exist already.
 func createDockerNetwork(ctx context.Context, cli *client.Client) error {
 	nw := config.Get().Docker.Network
+	//DIRTY PATCH: if nw.Driver is 'host' then skip this
+	if nw.Driver == "host" {
+		return nil
+	}
+
 	_, err := cli.NetworkCreate(ctx, nw.Name, types.NetworkCreate{
 		Driver:     nw.Driver,
 		EnableIPv6: true,

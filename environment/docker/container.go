@@ -194,7 +194,11 @@ func (e *Environment) Create() error {
 	}
 
 	networkMode := container.NetworkMode(cfg.Docker.Network.Mode)
-	if a.ForceOutgoingIP {
+
+	//DIRTY PATCH: if network mode is host then we use hosts network stack, dont need to do this.
+	//if you want to support multiple IP's on the host machine, you have to allow ForceOutgoingIP.
+	//unfortunately this will do the NAT stuff through docker defeating the purpose of "host" mode..
+	if networkMode != "host" && a.ForceOutgoingIP {
 		e.log().Debug("environment/docker: forcing outgoing IP address")
 		networkName := "ip-" + strings.ReplaceAll(strings.ReplaceAll(a.DefaultMapping.Ip, ".", "-"), ":", "-")
 		networkMode = container.NetworkMode(networkName)
