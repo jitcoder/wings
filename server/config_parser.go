@@ -3,9 +3,11 @@ package server
 import (
 	"runtime"
 
+	"emperror.dev/errors"
 	"github.com/gammazero/workerpool"
 
 	"github.com/pterodactyl/wings/internal/ufs"
+	"github.com/pterodactyl/wings/parser"
 )
 
 // UpdateConfigurationFiles updates all the defined configuration files for
@@ -20,15 +22,35 @@ func (s *Server) UpdateConfigurationFiles() {
 		f := cf
 
 		pool.Submit(func() {
-			file, err := s.Filesystem().UnixFS().Touch(f.FileName, ufs.O_RDWR|ufs.O_CREATE, 0o644)
+			// Carry on with the other files if updating this one panics.
+			defer func() {
+				if r := recover(); r != nil {
+					s.Log().WithField("file_name", f.FileName).WithField("panic", r).Error("recovered from panic while updating configuration file")
+				}
+			}()
+
+			if f.Parser == parser.File {
+				if _, err := s.Filesystem().UnixFS().Stat(f.FileName); errors.Is(err, ufs.ErrNotExist) {
+					s.Log().WithField("file_name", f.FileName).Debug("skipping text configuration file that does not exist yet")
+					return
+				}
+			}
+
+			// Writes to the file count against the server's disk limit.
+			file, err := s.Filesystem().Touch(f.FileName, ufs.O_RDWR|ufs.O_CREATE)
 			if err != nil {
 				s.Log().WithField("file_name", f.FileName).WithField("error", err).Error("failed to open file for configuration")
 				return
 			}
-			defer file.Close()
 
 			if err := f.Parse(file); err != nil {
 				s.Log().WithField("error", err).Error("failed to parse and update server configuration file")
+			}
+			if err := file.Close(); err != nil {
+				s.Log().WithField("file_name", f.FileName).WithField("error", err).Error("failed to close configuration file")
+			}
+			if err := s.Filesystem().Chown(f.FileName); err != nil {
+				s.Log().WithField("file_name", f.FileName).WithField("error", err).Warn("failed to set the owner of configuration file")
 			}
 
 			s.Log().WithField("file_name", f.FileName).Debug("finished processing server configuration file")

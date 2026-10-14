@@ -3,23 +3,25 @@ package server
 import (
 	"bufio"
 	"context"
-	"html/template"
 	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"text/template"
 	"time"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
-	"github.com/docker/docker/api/types"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
 
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/environment"
+	"github.com/pterodactyl/wings/environment/docker"
 	"github.com/pterodactyl/wings/remote"
 	"github.com/pterodactyl/wings/system"
 )
@@ -143,12 +145,32 @@ func (s *Server) IsInstalling() bool {
 	return s.installing.Load()
 }
 
+func (s *Server) SetInstalling(state bool) {
+	s.installing.Store(state)
+	if state {
+		s.Sftp().CancelAll()
+	}
+}
+
 func (s *Server) IsTransferring() bool {
 	return s.transferring.Load()
 }
 
 func (s *Server) SetTransferring(state bool) {
 	s.transferring.Store(state)
+	if state {
+		s.Sftp().CancelAll()
+	}
+}
+
+// StartTransferring marks the server as being transferred, returning false if
+// it already is, or if it is being installed or restored.
+func (s *Server) StartTransferring() bool {
+	if s.IsInstalling() || s.IsRestoring() || !s.transferring.SwapIf(true) {
+		return false
+	}
+	s.Sftp().CancelAll()
+	return true
 }
 
 func (s *Server) IsRestoring() bool {
@@ -157,15 +179,22 @@ func (s *Server) IsRestoring() bool {
 
 func (s *Server) SetRestoring(state bool) {
 	s.restoring.Store(state)
+	if state {
+		s.Sftp().CancelAll()
+	}
+}
+
+func (s *Server) IsInProtectedState() bool {
+	return s.IsInstalling() || s.IsTransferring() || s.IsRestoring()
 }
 
 // RemoveContainer removes the installation container for the server.
 func (ip *InstallationProcess) RemoveContainer() error {
-	err := ip.client.ContainerRemove(ip.Server.Context(), ip.Server.ID()+"_installer", types.ContainerRemoveOptions{
+	err := ip.client.ContainerRemove(ip.Server.Context(), ip.Server.ID()+"_installer", container.RemoveOptions{
 		RemoveVolumes: true,
 		Force:         true,
 	})
-	if err != nil && !client.IsErrNotFound(err) {
+	if err != nil && !cerrdefs.IsNotFound(err) {
 		return err
 	}
 	return nil
@@ -180,6 +209,7 @@ func (ip *InstallationProcess) Run() error {
 	if !ip.Server.installing.SwapIf(true) {
 		return errors.New("install: cannot obtain installation lock")
 	}
+	ip.Server.Sftp().CancelAll()
 
 	// We now have an exclusive lock on this installation process. Ensure that whenever this
 	// process is finished that the semaphore is released so that other processes and be executed
@@ -221,7 +251,7 @@ func (ip *InstallationProcess) writeScriptToDisk() error {
 	if err := os.MkdirAll(ip.tempDir(), 0o700); err != nil {
 		return errors.WithMessage(err, "could not create temporary directory for install process")
 	}
-	f, err := os.OpenFile(filepath.Join(ip.tempDir(), "install.sh"), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(filepath.Join(ip.tempDir(), "install.sh"), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644) //nolint:gosec // read by the install container, which may not run as root
 	if err != nil {
 		return errors.WithMessage(err, "failed to write server installation script to disk before mount")
 	}
@@ -234,20 +264,13 @@ func (ip *InstallationProcess) writeScriptToDisk() error {
 
 // Pulls the docker image to be used for the installation container.
 func (ip *InstallationProcess) pullInstallationImage() error {
-	// Get a registry auth configuration from the config.
-	var registryAuth *config.RegistryConfiguration
-	for registry, c := range config.Get().Docker.Registries {
-		if !strings.HasPrefix(ip.Script.ContainerImage, registry) {
-			continue
-		}
-
+	registry, registryAuth := config.Get().Docker.RegistryCredentialsForImage(ip.Script.ContainerImage)
+	if registryAuth != nil {
 		log.WithField("registry", registry).Debug("using authentication for registry")
-		registryAuth = &c
-		break
 	}
 
 	// Get the ImagePullOptions.
-	imagePullOptions := types.ImagePullOptions{All: false}
+	imagePullOptions := image.PullOptions{All: false}
 	if registryAuth != nil {
 		b64, err := registryAuth.Base64()
 		if err != nil {
@@ -260,7 +283,7 @@ func (ip *InstallationProcess) pullInstallationImage() error {
 
 	r, err := ip.client.ImagePull(ip.Server.Context(), ip.Script.ContainerImage, imagePullOptions)
 	if err != nil {
-		images, ierr := ip.client.ImageList(ip.Server.Context(), types.ImageListOptions{})
+		images, ierr := ip.client.ImageList(ip.Server.Context(), image.ListOptions{})
 		if ierr != nil {
 			// Well damn, something has gone really wrong here, just go ahead and abort there
 			// isn't much anything we can do to try and self-recover from this.
@@ -329,16 +352,20 @@ func (ip *InstallationProcess) GetLogPath() string {
 // This grabs the logs from the process to store in the server configuration
 // directory, and then destroys the associated installation container.
 func (ip *InstallationProcess) AfterExecute(containerId string) error {
-	defer ip.RemoveContainer()
+	defer func() {
+		if err := ip.RemoveContainer(); err != nil {
+			ip.Server.Log().WithField("error", err).Warn("failed to remove installation container")
+		}
+	}()
 
 	ip.Server.Log().WithField("container_id", containerId).Debug("pulling installation logs for server")
-	reader, err := ip.client.ContainerLogs(ip.Server.Context(), containerId, types.ContainerLogsOptions{
+	reader, err := ip.client.ContainerLogs(ip.Server.Context(), containerId, container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     false,
 	})
 
-	if err != nil && !client.IsErrNotFound(err) {
+	if err != nil && !cerrdefs.IsNotFound(err) {
 		return err
 	}
 
@@ -423,10 +450,12 @@ func (ip *InstallationProcess) Execute() (string, error) {
 				ReadOnly: false,
 			},
 			{
+				// The script only needs to be read, and must not be changed while
+				// it is running.
 				Target:   "/mnt/install",
 				Source:   ip.tempDir(),
 				Type:     mount.TypeBind,
-				ReadOnly: false,
+				ReadOnly: true,
 			},
 		},
 		Resources: ip.resourceLimits(),
@@ -437,6 +466,12 @@ func (ip *InstallationProcess) Execute() (string, error) {
 		LogConfig:   cfg.Docker.ContainerLogConfig(),
 		NetworkMode: container.NetworkMode(cfg.Docker.Network.Mode),
 		UsernsMode:  container.UsernsMode(cfg.Docker.UsernsMode),
+		// Install scripts run as root, and commonly install packages, so they keep
+		// the capabilities that needs. Drop the ones they do not need.
+		SecurityOpt: []string{"no-new-privileges"},
+		CapDrop: []string{
+			"setpcap", "mknod", "audit_write", "net_raw", "sys_chroot",
+		},
 	}
 
 	// Ensure the root directory for the server exists properly before attempting
@@ -463,9 +498,11 @@ func (ip *InstallationProcess) Execute() (string, error) {
 	}
 
 	ip.Server.Log().WithField("container_id", r.ID).Info("running installation script for server in container")
-	if err := ip.client.ContainerStart(ctx, r.ID, types.ContainerStartOptions{}); err != nil {
+	if err := ip.client.ContainerStart(ctx, r.ID, container.StartOptions{}); err != nil {
 		return "", err
 	}
+
+	docker.SetCpuBurst(ctx, ip.client, r.ID, hostConf.Resources.CPUQuota)
 
 	// Process the install event in the background by listening to the stream output until the
 	// container has stopped, at which point we'll disconnect from it.
@@ -498,7 +535,7 @@ func (ip *InstallationProcess) Execute() (string, error) {
 // the server configuration directory, as well as to a websocket listener so
 // that the process can be viewed in the panel by administrators.
 func (ip *InstallationProcess) StreamOutput(ctx context.Context, id string) error {
-	opts := types.ContainerLogsOptions{ShowStdout: true, ShowStderr: true, Follow: true}
+	opts := container.LogsOptions{ShowStdout: true, ShowStderr: true, Follow: true}
 	reader, err := ip.client.ContainerLogs(ctx, id, opts)
 	if err != nil {
 		return err
@@ -541,13 +578,17 @@ func (ip *InstallationProcess) resourceLimits() container.Resources {
 	}
 
 	resources := cfg.AsContainerResources()
-	// Explicitly remove the PID limits for the installation container. These scripts are
-	// defined at an administrative level and users can't manually execute things like a
-	// fork bomb during this process.
-	resources.PidsLimit = nil
+	// Installation scripts can need more processes than the server itself, for example
+	// when compiling, so use a higher limit than the server's.
+	pids := max(config.Get().Docker.ContainerPidLimit, installerPidLimit)
+	resources.PidsLimit = &pids
 
 	return resources
 }
+
+// installerPidLimit is the lowest limit on the number of processes in an
+// installation container.
+const installerPidLimit int64 = 4096
 
 // SyncInstallState makes an HTTP request to the Panel instance notifying it that
 // the server has completed the installation process, and what the state of the

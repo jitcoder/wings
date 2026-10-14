@@ -2,16 +2,18 @@ package backup
 
 import (
 	"context"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec // see Checksum
 	"encoding/hex"
 	"io"
 	"io/fs"
 	"os"
 	"path"
+	"strings"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
-	"github.com/mholt/archiver/v4"
+	"github.com/google/uuid"
+	"github.com/mholt/archives"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/pterodactyl/wings/config"
@@ -19,9 +21,10 @@ import (
 	"github.com/pterodactyl/wings/server/filesystem"
 )
 
-var format = archiver.CompressedArchive{
-	Compression: archiver.Gz{},
-	Archival:    archiver.Tar{},
+var format = archives.CompressedArchive{
+	Compression: archives.Gz{},
+	Archival:    archives.Tar{},
+	Extraction:  archives.Tar{},
 }
 
 type AdapterType string
@@ -90,13 +93,37 @@ func (b *Backup) Identifier() string {
 	return b.Uuid
 }
 
+func (b *Backup) normalizedIdentifier() (string, error) {
+	parsed, err := uuid.Parse(b.Identifier())
+	if err != nil || len(b.Identifier()) != len(parsed.String()) || parsed.String() != strings.ToLower(b.Identifier()) {
+		return "", errors.New("backup: identifier must be a valid UUID")
+	}
+	return parsed.String(), nil
+}
+
+func (b *Backup) validateIdentifier() error {
+	identifier, err := b.normalizedIdentifier()
+	if err != nil {
+		return err
+	}
+	b.Uuid = identifier
+	return nil
+}
+
 // Path returns the path for this specific backup.
 func (b *Backup) Path() string {
-	return path.Join(config.Get().System.BackupDirectory, b.Identifier()+".tar.gz")
+	identifier, err := b.normalizedIdentifier()
+	if err != nil {
+		identifier = path.Base(b.Identifier())
+	}
+	return path.Join(config.Get().System.BackupDirectory, identifier+".tar.gz")
 }
 
 // Size returns the size of the generated backup.
 func (b *Backup) Size() (int64, error) {
+	if err := b.validateIdentifier(); err != nil {
+		return 0, err
+	}
 	st, err := os.Stat(b.Path())
 	if err != nil {
 		return 0, err
@@ -105,9 +132,12 @@ func (b *Backup) Size() (int64, error) {
 	return st.Size(), nil
 }
 
-// Checksum returns the SHA256 checksum of a backup.
+// Checksum returns the SHA1 checksum of a backup.
 func (b *Backup) Checksum() ([]byte, error) {
-	h := sha1.New()
+	if err := b.validateIdentifier(); err != nil {
+		return nil, err
+	}
+	h := sha1.New() //nolint:gosec // integrity checksum; the Panel expects checksum_type "sha1"
 
 	f, err := os.Open(b.Path())
 	if err != nil {
@@ -127,7 +157,7 @@ func (b *Backup) Checksum() ([]byte, error) {
 // the disk to the caller.
 func (b *Backup) Details(ctx context.Context, parts []remote.BackupPart) (*ArchiveDetails, error) {
 	ad := ArchiveDetails{ChecksumType: "sha1", Parts: parts}
-	g, ctx := errgroup.WithContext(ctx)
+	var g errgroup.Group
 
 	g.Go(func() error {
 		resp, err := b.Checksum()

@@ -7,7 +7,7 @@ import (
 
 	"emperror.dev/errors"
 	"github.com/juju/ratelimit"
-	"github.com/mholt/archiver/v4"
+	"github.com/mholt/archives"
 
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/remote"
@@ -35,6 +35,9 @@ func NewLocal(client remote.Client, uuid string, ignore string) *LocalBackup {
 // will obviously only work if the backup was created as a local backup.
 func LocateLocal(client remote.Client, uuid string) (*LocalBackup, os.FileInfo, error) {
 	b := NewLocal(client, uuid, "")
+	if err := b.validateIdentifier(); err != nil {
+		return nil, nil, err
+	}
 	st, err := os.Stat(b.Path())
 	if err != nil {
 		return nil, nil, err
@@ -49,6 +52,9 @@ func LocateLocal(client remote.Client, uuid string) (*LocalBackup, os.FileInfo, 
 
 // Remove removes a backup from the system.
 func (b *LocalBackup) Remove() error {
+	if err := b.validateIdentifier(); err != nil {
+		return err
+	}
 	return os.Remove(b.Path())
 }
 
@@ -60,6 +66,9 @@ func (b *LocalBackup) WithLogContext(c map[string]interface{}) {
 // Generate generates a backup of the selected files and pushes it to the
 // defined location for this instance.
 func (b *LocalBackup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ignore string) (*ArchiveDetails, error) {
+	if err := b.validateIdentifier(); err != nil {
+		return nil, err
+	}
 	a := &filesystem.Archive{
 		Filesystem: fsys,
 		Ignore:     ignore,
@@ -81,6 +90,9 @@ func (b *LocalBackup) Generate(ctx context.Context, fsys *filesystem.Filesystem,
 // Restore will walk over the archive and call the callback function for each
 // file encountered.
 func (b *LocalBackup) Restore(ctx context.Context, _ io.Reader, callback RestoreCallback) error {
+	if err := b.validateIdentifier(); err != nil {
+		return err
+	}
 	f, err := os.Open(b.Path())
 	if err != nil {
 		return err
@@ -93,7 +105,7 @@ func (b *LocalBackup) Restore(ctx context.Context, _ io.Reader, callback Restore
 	if writeLimit := int64(config.Get().System.Backups.WriteLimit * 1024 * 1024); writeLimit > 0 {
 		reader = ratelimit.Reader(f, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
 	}
-	if err := format.Extract(ctx, reader, nil, func(ctx context.Context, f archiver.File) error {
+	if err := format.Extract(ctx, reader, func(ctx context.Context, f archives.FileInfo) error {
 		r, err := f.Open()
 		if err != nil {
 			return err

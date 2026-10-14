@@ -12,7 +12,7 @@ import (
 	"emperror.dev/errors"
 	"github.com/cenkalti/backoff/v4"
 	"github.com/juju/ratelimit"
-	"github.com/mholt/archiver/v4"
+	"github.com/mholt/archives"
 
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/remote"
@@ -38,6 +38,9 @@ func NewS3(client remote.Client, uuid string, ignore string) *S3Backup {
 
 // Remove removes a backup from the system.
 func (s *S3Backup) Remove() error {
+	if err := s.validateIdentifier(); err != nil {
+		return err
+	}
 	return os.Remove(s.Path())
 }
 
@@ -49,7 +52,14 @@ func (s *S3Backup) WithLogContext(c map[string]interface{}) {
 // Generate creates a new backup on the disk, moves it into the S3 bucket via
 // the provided presigned URL, and then deletes the backup from the disk.
 func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ignore string) (*ArchiveDetails, error) {
-	defer s.Remove()
+	if err := s.validateIdentifier(); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err := s.Remove(); err != nil && !errors.Is(err, os.ErrNotExist) {
+			s.log().WithField("error", err).Warn("failed to remove local copy of backup")
+		}
+	}()
 
 	a := &filesystem.Archive{
 		Filesystem: fsys,
@@ -93,7 +103,7 @@ func (s *S3Backup) Restore(ctx context.Context, r io.Reader, callback RestoreCal
 	if writeLimit := int64(config.Get().System.Backups.WriteLimit * 1024 * 1024); writeLimit > 0 {
 		reader = ratelimit.Reader(r, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
 	}
-	if err := format.Extract(ctx, reader, nil, func(ctx context.Context, f archiver.File) error {
+	if err := format.Extract(ctx, reader, func(ctx context.Context, f archives.FileInfo) error {
 		r, err := f.Open()
 		if err != nil {
 			return err
@@ -231,7 +241,6 @@ func (fu *s3FileUploader) uploadPart(ctx context.Context, part string, size int6
 
 		return nil
 	}, fu.backoff(ctx))
-
 	if err != nil {
 		if v, ok := err.(*backoff.PermanentError); ok {
 			return "", v.Unwrap()

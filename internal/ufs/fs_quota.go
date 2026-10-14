@@ -4,11 +4,18 @@
 package ufs
 
 import (
+	"math"
 	"sync/atomic"
+
+	"golang.org/x/sys/unix"
 )
 
-// Quota .
-// TODO: document
+// Quota is a wrapper around [*UnixFS] that provides the ability to limit the
+// disk usage of the filesystem.
+//
+// NOTE: this is not a full complete quota filesystem, it provides utilities for
+// tracking and checking the usage of the filesystem. The only operation that is
+// automatically accounted against the quota are file deletions.
 type Quota struct {
 	// fs is the underlying filesystem that runs the actual I/O operations.
 	*UnixFS
@@ -28,8 +35,7 @@ type Quota struct {
 	usage atomic.Int64
 }
 
-// NewQuota .
-// TODO: document
+// NewQuota creates a new Quota filesystem using an existing UnixFS and a limit.
 func NewQuota(fs *UnixFS, limit int64) *Quota {
 	qfs := Quota{UnixFS: fs}
 	qfs.limit.Store(limit)
@@ -64,14 +70,33 @@ func (fs *Quota) SetUsage(newUsage int64) int64 {
 
 // Add adds `i` to the tracked usage total.
 func (fs *Quota) Add(i int64) int64 {
-	usage := fs.Usage()
+	for {
+		usage := fs.Usage()
+		var next int64
 
-	// If adding `i` to the usage will put us below 0, cap it. (`i` can be negative)
-	if usage+i < 0 {
-		fs.usage.Store(0)
-		return 0
+		switch {
+		case i > 0:
+			if usage > math.MaxInt64-i {
+				next = math.MaxInt64
+			} else {
+				next = usage + i
+			}
+		case i < 0:
+			if i == math.MinInt64 {
+				next = 0
+			} else if usage <= -i {
+				next = 0
+			} else {
+				next = usage + i
+			}
+		default:
+			return usage
+		}
+
+		if fs.usage.CompareAndSwap(usage, next) {
+			return next
+		}
 	}
-	return fs.usage.Add(i)
 }
 
 // CanFit checks if the given size can fit in the filesystem without exceeding
@@ -95,16 +120,20 @@ func (fs *Quota) CanFit(size int64) bool {
 		return true
 	}
 
-	// If the current usage + the requested size are under the limit of the
-	// filesystem, allow it.
-	if usage+size <= limit {
+	if size <= 0 {
 		return true
 	}
 
-	// Welp, the size would exceed the limit of the filesystem, deny it.
-	return false
+	if usage >= limit {
+		return false
+	}
+
+	return size <= limit-usage
 }
 
+// Remove removes the named file or (empty) directory.
+//
+// If there is an error, it will be of type [*PathError].
 func (fs *Quota) Remove(name string) error {
 	// For information on why this interface is used here, check its
 	// documentation.
@@ -113,13 +142,7 @@ func (fs *Quota) Remove(name string) error {
 		return err
 	}
 
-	// Don't reduce the quota's usage as `name` is not a regular file.
-	if !s.Mode().IsRegular() {
-		return nil
-	}
-
-	// Remove the size of the deleted file from the quota usage.
-	fs.Add(-s.Size())
+	fs.Add(-freedBy(s))
 	return nil
 }
 
@@ -129,7 +152,7 @@ func (fs *Quota) Remove(name string) error {
 // it encounters. If the path does not exist, RemoveAll
 // returns nil (no error).
 //
-// If there is an error, it will be of type *PathError.
+// If there is an error, it will be of type [*PathError].
 func (fs *Quota) RemoveAll(name string) error {
 	name, err := fs.unsafePath(name)
 	if err != nil {
@@ -155,9 +178,23 @@ func (fs *Quota) removeAll(path string) error {
 func (fs *Quota) unlinkat(dirfd int, name string, flags int) error {
 	if flags == 0 {
 		s, err := fs.Lstatat(dirfd, name)
-		if err == nil && s.Mode().IsRegular() {
-			fs.Add(-s.Size())
+		if err == nil {
+			fs.Add(-freedBy(s))
 		}
 	}
 	return fs.UnixFS.unlinkat(dirfd, name, flags)
+}
+
+// freedBy returns the number of bytes removing the name described by s frees.
+// Only regular files count towards the usage. A file with other names (hard
+// links) keeps its data and is only counted once, so removing one of several
+// names frees nothing.
+func freedBy(s FileInfo) int64 {
+	if !s.Mode().IsRegular() {
+		return 0
+	}
+	if st, ok := s.Sys().(*unix.Stat_t); ok && st.Nlink > 1 {
+		return 0
+	}
+	return s.Size()
 }

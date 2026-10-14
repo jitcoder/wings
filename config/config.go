@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -68,6 +69,14 @@ type SftpConfiguration struct {
 	Port int `default:"2022" json:"bind_port" yaml:"bind_port"`
 	// If set to true, no write actions will be allowed on the SFTP server.
 	ReadOnly bool `default:"false" yaml:"read_only"`
+	// The maximum number of connections a single user may have open at once, or
+	// zero to use the default of 32.
+	MaxConnectionsPerUser int `json:"-" yaml:"max_connections_per_user"`
+	// The maximum number of connections from a single IP address, or IPv6 /64
+	// network, that may be authenticating at once, or zero to use the default of
+	// 16. Raise this if clients connect through a proxy, since they then all
+	// appear to come from the address of the proxy.
+	MaxAuthenticatingConnectionsPerIP int `json:"-" yaml:"max_authenticating_connections_per_ip"`
 }
 
 // ApiConfiguration defines the configuration for the internal API that is
@@ -90,6 +99,11 @@ type ApiConfiguration struct {
 	// is enabled on this instance. If set to "true" remote downloads will not be possible for
 	// servers.
 	DisableRemoteDownload bool `json:"-" yaml:"disable_remote_download"`
+
+	// RemoteDownloadAllowlist allows remote downloads of files into server directories to
+	// connect to otherwise blocked private/internal destinations. Entries may be hostnames,
+	// IP addresses, or CIDR ranges.
+	RemoteDownloadAllowlist []string `json:"-" yaml:"remote_download_allowlist"`
 
 	// The maximum size for files uploaded through the Panel in MB.
 	UploadLimit int64 `default:"100" json:"upload_limit" yaml:"upload_limit"`
@@ -176,11 +190,11 @@ type SystemConfiguration struct {
 	Passwd struct {
 		// Enable controls whether generated passwd files should be mounted into containers.
 		//
-		// By default this option is disabled and Wings will not mount any additional passwd
-		// files into containers.
+		// By default this option is disabled and Wings will not mount any
+		// additional passwd files into containers.
 		Enable bool `yaml:"enabled" default:"false"`
 
-		// Directory is the directory on disk where the generated files will be stored.
+		// Directory is the directory on disk where the generated passwd files will be stored.
 		// This directory may be temporary as it will be re-created whenever Wings is started.
 		//
 		// This path **WILL** be both written to by Wings and mounted into containers created by
@@ -190,6 +204,26 @@ type SystemConfiguration struct {
 		// correct SELinux context in order for containers to use it.
 		Directory string `yaml:"directory" default:"/run/wings/etc"`
 	} `yaml:"passwd"`
+
+	// MachineID controls the mounting of a generated `/etc/machine-id` file into containers started by Wings.
+	MachineID struct {
+		// Enable controls whether a generated machine-id file should be mounted
+		// into containers.
+		//
+		// By default this option is enabled and Wings will mount an additional
+		// machine-id file into containers.
+		Enable bool `yaml:"enabled" default:"true"`
+
+		// Directory is the directory on disk where the generated machine-id files will be stored.
+		// This directory may be temporary as it will be re-created whenever Wings is started.
+		//
+		// This path **WILL** be both written to by Wings and mounted into containers created by
+		// Wings. If you are running Wings itself in a container, this path will need to be mounted
+		// into the Wings container as the exact path on the host, which should match the value
+		// specified here. If you are using SELinux, you will need to make sure this file has the
+		// correct SELinux context in order for containers to use it.
+		Directory string `yaml:"directory" default:"/run/wings/machine-id"`
+	} `yaml:"machine_id"`
 
 	// The amount of time in seconds that can elapse before a server's disk space calculation is
 	// considered stale and a re-check should occur. DANGER: setting this value too low can seriously
@@ -268,6 +302,10 @@ type Backups struct {
 	//
 	// Defaults to "best_speed" (level 1)
 	CompressionLevel string `default:"best_speed" yaml:"compression_level"`
+
+	// RestoreHostAllowlist allows backup restore downloads to connect to otherwise blocked
+	// private/internal destinations. Entries may be hostnames, IP addresses, or CIDR ranges.
+	RestoreHostAllowlist []string `yaml:"restore_host_allowlist"`
 }
 
 type Transfers struct {
@@ -294,7 +332,14 @@ type ConsoleThrottles struct {
 	Period uint64 `json:"line_reset_interval" yaml:"line_reset_interval" default:"100"`
 }
 
+type Token struct {
+	ID    string
+	Token string
+}
+
 type Configuration struct {
+	Token Token `json:"-" yaml:"-"`
+
 	// The location from which this configuration instance was instantiated.
 	path string
 
@@ -337,7 +382,7 @@ type Configuration struct {
 	// additional origins.
 	AllowedOrigins []string `json:"allowed_origins" yaml:"allowed_origins"`
 
-	// AllowCORSPrivateNetwork sets the `Access-Control-Request-Private-Network` header which
+	// AllowCORSPrivateNetwork sets the `Access-Control-Allow-Private-Network` header which
 	// allows client browsers to make requests to internal IP addresses over HTTP.  This setting
 	// is only required by users running Wings without SSL certificates and using internal IP
 	// addresses in order to connect. Most users should NOT enable this setting.
@@ -347,10 +392,75 @@ type Configuration struct {
 	IgnorePanelConfigUpdates bool `json:"ignore_panel_config_updates" yaml:"ignore_panel_config_updates"`
 }
 
+// PanelConfiguration contains the only configuration values the Panel is allowed
+// to set on a node. Everything else in the configuration controls how Wings itself
+// runs on the host and must only be changed by the node operator.
+type PanelConfiguration struct {
+	Debug   bool   `json:"debug"`
+	Uuid    string `json:"uuid"`
+	TokenId string `json:"token_id"`
+	Token   string `json:"token"`
+	Api     struct {
+		Host string `json:"host"`
+		Port int    `json:"port"`
+		Ssl  struct {
+			Enabled         bool   `json:"enabled"`
+			CertificateFile string `json:"cert"`
+			KeyFile         string `json:"key"`
+		} `json:"ssl"`
+		UploadLimit int64 `json:"upload_limit"`
+	} `json:"api"`
+	System struct {
+		Sftp struct {
+			Port int `json:"bind_port"`
+		} `json:"sftp"`
+	} `json:"system"`
+}
+
+// PanelConfiguration returns the values in the configuration that the Panel is
+// allowed to set.
+func (c *Configuration) PanelConfiguration() PanelConfiguration {
+	var p PanelConfiguration
+	p.Debug = c.Debug
+	p.Uuid = c.Uuid
+	p.TokenId = c.AuthenticationTokenId
+	p.Token = c.AuthenticationToken
+	p.Api.Host = c.Api.Host
+	p.Api.Port = c.Api.Port
+	p.Api.Ssl.Enabled = c.Api.Ssl.Enabled
+	p.Api.Ssl.CertificateFile = c.Api.Ssl.CertificateFile
+	p.Api.Ssl.KeyFile = c.Api.Ssl.KeyFile
+	p.Api.UploadLimit = c.Api.UploadLimit
+	p.System.Sftp.Port = c.System.Sftp.Port
+	return p
+}
+
+// ApplyPanelConfiguration sets the values in the configuration that the Panel is
+// allowed to set.
+func (c *Configuration) ApplyPanelConfiguration(p PanelConfiguration) {
+	c.Debug = p.Debug
+	c.Uuid = p.Uuid
+	c.AuthenticationTokenId = p.TokenId
+	c.AuthenticationToken = p.Token
+	c.Api.Host = p.Api.Host
+	c.Api.Port = p.Api.Port
+	c.Api.Ssl.Enabled = p.Api.Ssl.Enabled
+	c.Api.Ssl.CertificateFile = p.Api.Ssl.CertificateFile
+	c.Api.Ssl.KeyFile = p.Api.Ssl.KeyFile
+	c.Api.UploadLimit = p.Api.UploadLimit
+	c.System.Sftp.Port = p.System.Sftp.Port
+}
+
 // NewAtPath creates a new struct and set the path where it should be stored.
 // This function does not modify the currently stored global configuration.
 func NewAtPath(path string) (*Configuration, error) {
 	var c Configuration
+	// Configures the default values for many of the configuration options present
+	// in the structs. Values set in the configuration file take priority over the
+	// default values.
+	if err := defaults.Set(&c); err != nil {
+		return nil, err
+	}
 	// Track the location where we created this configuration.
 	c.path = path
 	return &c, nil
@@ -361,11 +471,55 @@ func NewAtPath(path string) (*Configuration, error) {
 // will be paused until it is complete.
 func Set(c *Configuration) {
 	mu.Lock()
-	if _config == nil || _config.AuthenticationToken != c.AuthenticationToken {
-		_jwtAlgo = jwt.NewHS256([]byte(c.AuthenticationToken))
+	defer mu.Unlock()
+	token := c.Token.Token
+	if token == "" {
+		c.Token.Token = c.AuthenticationToken
+		token = c.Token.Token
+	}
+	if _config == nil || _config.Token.Token != token {
+		_jwtAlgo = jwt.NewHS256([]byte(token))
 	}
 	_config = c
-	mu.Unlock()
+}
+
+// ResolveToken populates the derived Token field, preferring values pinned
+// through the environment over those in the configuration itself.
+//
+// Set remote when the values came from the Panel. Local values may use
+// "file://" or "$VAR" indirection; expanding one sent over the network would
+// leak files and environment variables back out through the token we attach to
+// every request. Environment overrides must already match remote values so a
+// configuration update cannot leave Wings and the Panel using different keys.
+func (c *Configuration) ResolveToken(remote bool) error {
+	resolve := func(name, env, local string) (string, error) {
+		if remote && (strings.Contains(local, "$") || strings.HasPrefix(local, "file://")) {
+			return "", fmt.Errorf("config: remote %s cannot use token indirection", name)
+		}
+		if env != "" {
+			value, err := Expand(env)
+			if err != nil {
+				return "", err
+			}
+			if remote && value != local {
+				return "", fmt.Errorf("config: remote %s does not match environment override", name)
+			}
+			return value, nil
+		}
+		if remote {
+			return local, nil
+		}
+		return Expand(local)
+	}
+
+	var err error
+	if c.Token.ID, err = resolve("token ID", os.Getenv("WINGS_TOKEN_ID"), c.AuthenticationTokenId); err != nil {
+		return err
+	}
+	if c.Token.Token, err = resolve("token", os.Getenv("WINGS_TOKEN"), c.AuthenticationToken); err != nil {
+		return err
+	}
+	return nil
 }
 
 // SetDebugViaFlag tracks if the application is running in debug mode because of
@@ -373,9 +527,9 @@ func Set(c *Configuration) {
 // change to the disk.
 func SetDebugViaFlag(d bool) {
 	mu.Lock()
+	defer mu.Unlock()
 	_config.Debug = d
 	_debugViaFlag = d
-	mu.Unlock()
 }
 
 // Get returns the global configuration instance. This is a thread-safe operation
@@ -400,8 +554,8 @@ func Get() *Configuration {
 // the global configuration.
 func Update(callback func(c *Configuration)) {
 	mu.Lock()
+	defer mu.Unlock()
 	callback(_config)
-	mu.Unlock()
 }
 
 // GetJwtAlgorithm returns the in-memory JWT algorithm.
@@ -492,13 +646,13 @@ func EnsurePterodactylUser() error {
 		command = fmt.Sprintf("adduser -S -D -H -G %[1]s -s /sbin/nologin %[1]s", _config.System.Username)
 		// We have to create the group first on Alpine, so do that here before continuing on
 		// to the user creation process.
-		if _, err := exec.Command("addgroup", "-S", _config.System.Username).Output(); err != nil {
+		if _, err := exec.Command("addgroup", "-S", _config.System.Username).Output(); err != nil { //nolint:gosec // no shell; username comes from the operator's config
 			return err
 		}
 	}
 
 	split := strings.Split(command, " ")
-	if _, err := exec.Command(split[0], split[1:]...).Output(); err != nil {
+	if _, err := exec.Command(split[0], split[1:]...).Output(); err != nil { //nolint:gosec // no shell; username comes from the operator's config
 		return err
 	}
 	u, err = user.Lookup(_config.System.Username)
@@ -523,7 +677,7 @@ container:x:%d:
 nogroup:x:65534:`,
 		_config.System.User.Gid,
 	))
-	if err := os.WriteFile(filepath.Join(passwd.Directory, "group"), v, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(passwd.Directory, "group"), v, 0o644); err != nil { //nolint:gosec // mounted as /etc/group, which containers must be able to read
 		return fmt.Errorf("failed to write file to %s/group: %v", passwd.Directory, err)
 	}
 
@@ -535,32 +689,38 @@ nobody:x:65534:65534::/var/empty:/bin/sh
 		_config.System.User.Uid,
 		_config.System.User.Gid,
 	))
-	if err := os.WriteFile(filepath.Join(passwd.Directory, "passwd"), v, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(passwd.Directory, "passwd"), v, 0o644); err != nil { //nolint:gosec // mounted as /etc/passwd, which containers must be able to read
 		return fmt.Errorf("failed to write file to %s/passwd: %v", passwd.Directory, err)
 	}
 	return nil
 }
 
-// FromFile reads the configuration from the provided file and stores it in the
-// global singleton for this instance.
-func FromFile(path string) error {
-	b, err := os.ReadFile(path)
+// Load reads the configuration from the provided file without resolving its
+// token or storing it in the global singleton.
+func Load(path string) (*Configuration, error) {
+	b, err := os.ReadFile(path) //nolint:gosec // the configuration file chosen by the operator
 	if err != nil {
-		return err
+		return nil, err
 	}
 	c, err := NewAtPath(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
 	if err := yaml.Unmarshal(b, c); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// FromFile reads the configuration from the provided file and stores it in the
+// global singleton for this instance.
+func FromFile(path string) error {
+	c, err := Load(path)
+	if err != nil {
 		return err
 	}
 
-	// Configures the default values for many of the configuration options present
-	// in the structs. Values set in the configuration file will not be overridden by the
-	// default values.
-	if err := defaults.Set(c); err != nil {
+	if err := c.ResolveToken(false); err != nil {
 		return err
 	}
 
@@ -602,6 +762,11 @@ func ConfigureDirectories() error {
 		return err
 	}
 
+	log.WithField("path", _config.System.TmpDirectory).Debug("ensuring temporary data directory exists")
+	if err := os.MkdirAll(_config.System.TmpDirectory, 0o700); err != nil {
+		return err
+	}
+
 	log.WithField("path", _config.System.ArchiveDirectory).Debug("ensuring archive data directory exists")
 	if err := os.MkdirAll(_config.System.ArchiveDirectory, 0o700); err != nil {
 		return err
@@ -614,7 +779,14 @@ func ConfigureDirectories() error {
 
 	if _config.System.Passwd.Enable {
 		log.WithField("path", _config.System.Passwd.Directory).Debug("ensuring passwd directory exists")
-		if err := os.MkdirAll(_config.System.Passwd.Directory, 0o755); err != nil {
+		if err := os.MkdirAll(_config.System.Passwd.Directory, 0o755); err != nil { //nolint:gosec // files in here are mounted into containers
+			return err
+		}
+	}
+
+	if _config.System.MachineID.Enable {
+		log.WithField("path", _config.System.MachineID.Directory).Debug("ensuring machine-id directory exists")
+		if err := os.MkdirAll(_config.System.MachineID.Directory, 0o755); err != nil { //nolint:gosec // files in here are mounted into containers
 			return err
 		}
 	}
@@ -765,4 +937,37 @@ func UseOpenat2() bool {
 		openat2.Store(true)
 		return true
 	}
+}
+
+// Expand expands an input string by calling [os.ExpandEnv] to expand all
+// environment variables, then checks if the value is prefixed with `file://`
+// to support reading the value from a file.
+//
+// NOTE: the order of expanding environment variables first then checking if
+// the value references a file is important. This behaviour allows a user to
+// pass a value like `file://${CREDENTIALS_DIRECTORY}/token` to allow us to
+// work with credentials loaded by systemd's `LoadCredential` (or `LoadCredentialEncrypted`)
+// options without the user needing to assume the path of `CREDENTIALS_DIRECTORY`
+// or use a preStart script to read the files for us.
+func Expand(v string) (string, error) {
+	// Expand environment variables within the string.
+	//
+	// NOTE: this may cause issues if the string contains `$` and doesn't intend
+	// on getting expanded, however we are using this for our tokens which are
+	// all alphanumeric characters only.
+	v = os.ExpandEnv(v)
+
+	// Handle files.
+	const filePrefix = "file://"
+	if strings.HasPrefix(v, filePrefix) {
+		p := v[len(filePrefix):]
+
+		b, err := os.ReadFile(p) //nolint:gosec // file:// values come from the operator's config
+		if err != nil {
+			return "", err
+		}
+		v = string(bytes.TrimRight(bytes.TrimRight(b, "\r"), "\n"))
+	}
+
+	return v, nil
 }

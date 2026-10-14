@@ -1,16 +1,19 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
+	"github.com/asaskevich/govalidator"
 	"github.com/creasty/defaults"
 
 	"github.com/pterodactyl/wings/config"
@@ -69,11 +72,9 @@ type Server struct {
 	// Tracks open websocket connections for the server.
 	wsBag       *WebsocketBag
 	wsBagLocker sync.Mutex
+	sftpBag     *system.ContextBag
 
 	sinks map[system.SinkName]*system.SinkPool
-
-	logSink     *system.SinkPool
-	installSink *system.SinkPool
 }
 
 // New returns a new server instance with a context and all of the default
@@ -199,6 +200,16 @@ func (s *Server) Sync() error {
 
 	s.SyncWithEnvironment()
 
+	// If the server is suspended immediately disconnect all open websocket connections
+	// and any connected SFTP clients. We don't need to worry about revoking any JWTs
+	// here since they'll be blocked from re-connecting to the websocket anyways. This
+	// just forces the client to disconnect and attempt to reconnect (rather than waiting
+	// on them to send a message and hit that disconnect logic).
+	if s.IsSuspended() {
+		s.Websockets().CancelAll()
+		s.Sftp().CancelAll()
+	}
+
 	return nil
 }
 
@@ -209,24 +220,28 @@ func (s *Server) Sync() error {
 // can be called from scoped where the server may not be fully initialized,
 // therefore other things like the filesystem and environment may not exist yet.
 func (s *Server) SyncWithConfiguration(cfg remote.ServerConfigurationResponse) error {
-	c := Configuration{
+	c := configurationData{
 		CrashDetectionEnabled: config.Get().System.CrashDetection.CrashDetectionEnabled,
 	}
 	if err := json.Unmarshal(cfg.Settings, &c); err != nil {
 		return errors.WithStackIf(err)
 	}
 
+	// Only accept a UUID from the Panel, and never allow it to change once the
+	// server has been created.
+	if !govalidator.IsUUID(c.Uuid) {
+		return errors.New("server: configuration returned by the Panel contains an invalid server uuid")
+	}
+	if id := s.ID(); id != "" && id != c.Uuid {
+		return errors.New("server: configuration returned by the Panel is for a different server")
+	}
+
 	s.cfg.mu.Lock()
 	defer s.cfg.mu.Unlock()
 
-	// Lock the new configuration. Since we have the deferred Unlock above we need
-	// to make sure that the NEW configuration object is already locked since that
-	// defer is running on the memory address for "s.cfg.mu" which we're explicitly
-	// changing on the next line.
-	c.mu.Lock()
-
-	//goland:noinspection GoVetCopyLock
-	s.cfg = c
+	// Only replace the values, never the mutex, since other goroutines may be
+	// waiting to acquire it and would never be woken if it were overwritten.
+	s.cfg.configurationData = c
 
 	s.Lock()
 	s.procConfig = cfg.ProcessConfiguration
@@ -246,6 +261,18 @@ func (s *Server) CreateEnvironment() error {
 	// Ensure the data directory exists before getting too far through this process.
 	if err := s.EnsureDataDirectoryExists(); err != nil {
 		return err
+	}
+
+	cfg := config.Get()
+	if cfg.System.MachineID.Enable {
+		// Hytale wants a machine-id in order to encrypt tokens for the server. So
+		// write a machine-id file for the server that contains the server's UUID
+		// without any dashes.
+		p := filepath.Join(cfg.System.MachineID.Directory, s.ID())
+		machineID := append(bytes.ReplaceAll([]byte(s.ID()), []byte{'-'}, []byte{}), '\n')
+		if err := os.WriteFile(p, machineID, 0o644); err != nil { //nolint:gosec // mounted as /etc/machine-id, which the container user must be able to read
+			return fmt.Errorf("failed to write machine-id (at '%s') for server '%s': %w", p, s.ID(), err)
+		}
 	}
 
 	return s.Environment.Create()
@@ -359,6 +386,6 @@ func (s *Server) ToAPIResponse() APIResponse {
 		State:         s.Environment.State(),
 		IsSuspended:   s.IsSuspended(),
 		Utilization:   s.Proc(),
-		Configuration: *s.Config(),
+		Configuration: s.cfg.snapshot(),
 	}
 }

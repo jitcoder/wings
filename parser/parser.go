@@ -31,6 +31,40 @@ const (
 	Xml        = "xml"
 )
 
+// maxTextScanTokenSize bounds how large a single line the "file" parser will buffer.
+const maxTextScanTokenSize = 64 * 1024 * 1024
+
+// maxConfigFileSize caps how large a configuration file we'll attempt to parse.
+const maxConfigFileSize = 64 * 1024 * 1024
+
+// maxXMLDepth is the deepest element nesting of an XML configuration file that
+// is rewritten. Real configuration files are far shallower than this.
+const maxXMLDepth = 512
+
+// xmlDepth returns the element nesting depth of the tree rooted at root.
+func xmlDepth(root *etree.Element) int {
+	if root == nil {
+		return 0
+	}
+	type frame struct {
+		e *etree.Element
+		d int
+	}
+	stack := []frame{{root, 1}}
+	depth := 0
+	for len(stack) > 0 {
+		f := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if f.d > depth {
+			depth = f.d
+		}
+		for _, c := range f.e.ChildElements() {
+			stack = append(stack, frame{c, f.d + 1})
+		}
+	}
+	return depth
+}
+
 type ReplaceValue struct {
 	value     []byte
 	valueType jsonparser.ValueType
@@ -122,6 +156,11 @@ func (f *ConfigurationFile) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return err
 	}
+	for _, key := range []string{"file", "parser", "replace"} {
+		if m[key] == nil {
+			return errors.Errorf("parser: configuration file is missing the %q field", key)
+		}
+	}
 
 	if err := json.Unmarshal(*m["file"], &f.FileName); err != nil {
 		return err
@@ -142,6 +181,26 @@ func (f *ConfigurationFile) UnmarshalJSON(data []byte) error {
 
 // ConfigurationFileReplacement defines a single find/replace instance for a
 // given server configuration file.
+// Reads a key as text. The Panel encodes a numeric key such as "25565" as a JSON number,
+// so numbers and booleans are accepted alongside strings.
+func scalarString(data []byte, key string) (string, error) {
+	value, dataType, _, err := jsonparser.Get(data, key)
+	if err != nil {
+		return "", err
+	}
+
+	switch dataType {
+	case jsonparser.String:
+		return jsonparser.ParseString(value)
+	case jsonparser.Number, jsonparser.Boolean:
+		return string(value), nil
+	case jsonparser.Null:
+		return "", nil
+	default:
+		return "", errors.New("parser: " + key + " must be a string, number, or boolean")
+	}
+}
+
 type ConfigurationFileReplacement struct {
 	Match       string       `json:"match"`
 	IfValue     string       `json:"if_value"`
@@ -151,14 +210,14 @@ type ConfigurationFileReplacement struct {
 // UnmarshalJSON handles unmarshaling the JSON representation into a struct that
 // provides more useful data to this functionality.
 func (cfr *ConfigurationFileReplacement) UnmarshalJSON(data []byte) error {
-	m, err := jsonparser.GetString(data, "match")
+	m, err := scalarString(data, "match")
 	if err != nil {
 		return err
 	}
 
 	cfr.Match = m
 
-	iv, err := jsonparser.GetString(data, "if_value")
+	iv, err := scalarString(data, "if_value")
 	// We only check keypath here since match & replace_with should be present on all of
 	// them, however if_value is optional.
 	if err != nil && err != jsonparser.KeyPathNotFoundError {
@@ -188,13 +247,38 @@ func (cfr *ConfigurationFileReplacement) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+type templatableConfig struct {
+	Docker struct {
+		Interface string `json:"interface"`
+		Network   struct {
+			Interface string `json:"interface"`
+		} `json:"network"`
+	} `json:"docker"`
+}
+
+func newTemplatableConfig(c *config.Configuration) templatableConfig {
+	var t templatableConfig
+	t.Docker.Interface = c.Docker.Network.Interface
+	t.Docker.Network.Interface = c.Docker.Network.Interface
+	return t
+}
+
 // Parse parses a given configuration file and updates all the values within
 // as defined in the API response from the Panel.
 func (f *ConfigurationFile) Parse(file ufs.File) error {
 	// log.WithField("path", path).WithField("parser", f.Parser.String()).Debug("parsing server configuration file")
 
-	// What the fuck is going on here?
-	if mb, err := json.Marshal(config.Get()); err != nil {
+	// Refuse to parse files larger than the cap. Every parser below buffers the
+	// whole file in memory, and the contents are untrusted server-owned input, so
+	// this guards the daemon against being OOM'd by an oversized config. The
+	// server is still free to boot with the file as-is; we just don't rewrite it.
+	if info, err := file.Stat(); err != nil {
+		return err
+	} else if info.Size() > maxConfigFileSize {
+		return errors.Errorf("parser: refusing to parse configuration file %q: size %d exceeds limit of %d bytes", file.Name(), info.Size(), maxConfigFileSize)
+	}
+
+	if mb, err := json.Marshal(newTemplatableConfig(config.Get())); err != nil {
 		return err
 	} else {
 		f.configuration = mb
@@ -222,8 +306,13 @@ func (f *ConfigurationFile) Parse(file ufs.File) error {
 // Parses an xml file.
 func (f *ConfigurationFile) parseXmlFile(file ufs.File) error {
 	doc := etree.NewDocument()
-	if _, err := doc.ReadFrom(file); err != nil {
+	if _, err := doc.ReadFrom(io.LimitReader(file, maxConfigFileSize)); err != nil {
 		return err
+	}
+	// The server still boots with the file as it is, the same as for files over
+	// the size limit.
+	if depth := xmlDepth(doc.Root()); depth > maxXMLDepth {
+		return errors.Errorf("parser: refusing to parse configuration file %q: element nesting depth %d exceeds limit of %d", file.Name(), depth, maxXMLDepth)
 	}
 
 	// If there is no root we should create a basic start to the file. This isn't required though,
@@ -245,7 +334,7 @@ func (f *ConfigurationFile) parseXmlFile(file ufs.File) error {
 			doc.SetRoot(doc.CreateElement(parts[0]))
 		}
 
-		path := "./" + strings.Replace(replacement.Match, ".", "/", -1)
+		path := "./" + strings.ReplaceAll(replacement.Match, ".", "/")
 
 		// If we're not doing a wildcard replacement go ahead and create the
 		// missing element if we cannot find it yet.
@@ -281,27 +370,20 @@ func (f *ConfigurationFile) parseXmlFile(file ufs.File) error {
 		}
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
 	// Ensure the XML is indented properly.
 	doc.Indent(2)
 
-	// Write the XML to the file.
-	if _, err := doc.WriteTo(file); err != nil {
+	var buf bytes.Buffer
+	if _, err := doc.WriteTo(&buf); err != nil {
 		return err
 	}
-	return nil
+	return rewrite(file, buf.Bytes())
 }
 
 // Parses an ini file.
 func (f *ConfigurationFile) parseIniFile(file ufs.File) error {
 	// Wrap the file in a NopCloser so the ini package doesn't close the file.
-	cfg, err := ini.Load(io.NopCloser(file))
+	cfg, err := ini.Load(io.NopCloser(io.LimitReader(file, maxConfigFileSize)))
 	if err != nil {
 		return err
 	}
@@ -364,24 +446,18 @@ func (f *ConfigurationFile) parseIniFile(file ufs.File) error {
 		}
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
+	var buf bytes.Buffer
+	if _, err := cfg.WriteTo(&buf); err != nil {
 		return err
 	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
-	if _, err := cfg.WriteTo(file); err != nil {
-		return err
-	}
-	return nil
+	return rewrite(file, buf.Bytes())
 }
 
 // Parses a json file updating any matching key/value pairs. If a match is not found, the
 // value is set regardless in the file. See the commentary in parseYamlFile for more details
 // about what is happening during this process.
 func (f *ConfigurationFile) parseJsonFile(file ufs.File) error {
-	b, err := io.ReadAll(file)
+	b, err := io.ReadAll(io.LimitReader(file, maxConfigFileSize))
 	if err != nil {
 		return err
 	}
@@ -391,24 +467,13 @@ func (f *ConfigurationFile) parseJsonFile(file ufs.File) error {
 		return err
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
-	// Write the data to the file.
-	if _, err := io.Copy(file, bytes.NewReader(data.BytesIndent("", "    "))); err != nil {
-		return errors.Wrap(err, "parser: failed to write properties file to disk")
-	}
-	return nil
+	return rewrite(file, data.BytesIndent("", "    "))
 }
 
 // Parses a yaml file and updates any matching key/value pairs before persisting
 // it back to the disk.
 func (f *ConfigurationFile) parseYamlFile(file ufs.File) error {
-	b, err := io.ReadAll(file)
+	b, err := io.ReadAll(io.LimitReader(file, maxConfigFileSize))
 	if err != nil {
 		return err
 	}
@@ -439,18 +504,7 @@ func (f *ConfigurationFile) parseYamlFile(file ufs.File) error {
 		return err
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
-	// Write the data to the file.
-	if _, err := io.Copy(file, bytes.NewReader(marshaled)); err != nil {
-		return errors.Wrap(err, "parser: failed to write properties file to disk")
-	}
-	return nil
+	return rewrite(file, marshaled)
 }
 
 // Parses a text file using basic find and replace. This is a highly inefficient method of
@@ -458,7 +512,8 @@ func (f *ConfigurationFile) parseYamlFile(file ufs.File) error {
 // than this function where possible.
 func (f *ConfigurationFile) parseTextFile(file ufs.File) error {
 	b := bytes.NewBuffer(nil)
-	s := bufio.NewScanner(file)
+	s := bufio.NewScanner(io.LimitReader(file, maxConfigFileSize))
+	s.Buffer(make([]byte, 0, 64*1024), maxTextScanTokenSize)
 	var replaced bool
 	for s.Scan() {
 		line := s.Bytes()
@@ -476,20 +531,16 @@ func (f *ConfigurationFile) parseTextFile(file ufs.File) error {
 			b.Write(line)
 		}
 		b.WriteByte('\n')
+		// Apply the same limit to the result.
+		if b.Len() > maxConfigFileSize {
+			return errors.Errorf("parser: refusing to write configuration file %q: result exceeds limit of %d bytes", file.Name(), maxConfigFileSize)
+		}
+	}
+	if err := s.Err(); err != nil {
+		return errors.Wrap(err, "parser: failed to scan text file for configuration update")
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
-	// Write the data to the file.
-	if _, err := io.Copy(file, b); err != nil {
-		return errors.Wrap(err, "parser: failed to write properties file to disk")
-	}
-	return nil
+	return rewrite(file, b.Bytes())
 }
 
 // parsePropertiesFile parses a properties file and updates the values within it
@@ -519,7 +570,7 @@ func (f *ConfigurationFile) parseTextFile(file ufs.File) error {
 // @see https://github.com/pterodactyl/panel/issues/2308 (original)
 // @see https://github.com/pterodactyl/panel/issues/3009 ("bug" introduced as result)
 func (f *ConfigurationFile) parsePropertiesFile(file ufs.File) error {
-	b, err := io.ReadAll(file)
+	b, err := io.ReadAll(io.LimitReader(file, maxConfigFileSize))
 	if err != nil {
 		return err
 	}
@@ -578,16 +629,35 @@ func (f *ConfigurationFile) parsePropertiesFile(file ufs.File) error {
 		s.WriteString(key + "=" + strings.Trim(strconv.QuoteToASCII(value), "\"") + "\n")
 	}
 
+	return rewrite(file, s.Bytes())
+}
+
+// sizeChecker is implemented by files whose size counts against a disk limit.
+type sizeChecker interface {
+	// CheckSize returns an error if the file cannot grow to size bytes.
+	CheckSize(size int64) error
+}
+
+// rewrite replaces the contents of file with data. The file is left unchanged if
+// data is too large, or would not fit in the disk space the file may use.
+func rewrite(file ufs.File, data []byte) error {
+	if len(data) > maxConfigFileSize {
+		return errors.Errorf("parser: refusing to write configuration file %q: result exceeds limit of %d bytes", file.Name(), maxConfigFileSize)
+	}
+	if c, ok := file.(sizeChecker); ok {
+		if err := c.CheckSize(int64(len(data))); err != nil {
+			return err
+		}
+	}
+
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
 	if err := file.Truncate(0); err != nil {
 		return err
 	}
-
-	// Write the data to the file.
-	if _, err := io.Copy(file, s); err != nil {
-		return errors.Wrap(err, "parser: failed to write properties file to disk")
+	if _, err := file.Write(data); err != nil {
+		return errors.Wrap(err, "parser: failed to write configuration file to disk")
 	}
 	return nil
 }

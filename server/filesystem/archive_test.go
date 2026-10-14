@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	. "github.com/franela/goblin"
-	"github.com/mholt/archiver/v4"
+	"github.com/mholt/archives"
 )
 
 func TestArchive_Stream(t *testing.T) {
@@ -60,11 +60,11 @@ func TestArchive_Stream(t *testing.T) {
 			g.Assert(err).IsNil()
 
 			// Open the archive.
-			genericFs, err := archiver.FileSystem(context.Background(), archivePath)
+			genericFs, err := archives.FileSystem(context.Background(), archivePath, nil)
 			g.Assert(err).IsNil()
 
 			// Assert that we are opening an archive.
-			afs, ok := genericFs.(archiver.ArchiveFS)
+			afs, ok := genericFs.(iofs.ReadDirFS)
 			g.Assert(ok).IsTrue()
 
 			// Get the names of the files recursively from the archive.
@@ -83,6 +83,45 @@ func TestArchive_Stream(t *testing.T) {
 			sort.Strings(files)
 
 			g.Assert(files).Equal(expected)
+		})
+
+		g.It("treats regular expression metacharacters in ignore patterns literally", func() {
+			g.Assert(fs.CreateDirectory("world (copy)", "/")).IsNil()
+			g.Assert(fs.CreateDirectory("logs", "/")).IsNil()
+			for _, name := range []string{"world (copy)/level.dat", "logs/latest.log", "server.jar"} {
+				r := strings.NewReader("hello, world!\n")
+				g.Assert(fs.Write(name, r, r.Size(), 0o644)).IsNil()
+			}
+
+			a := &Archive{
+				Filesystem: fs,
+				Ignore:     "world (copy)/\n*.log\n",
+			}
+
+			archivePath := filepath.Join(rfs.root, "archive.tar.gz")
+			g.Assert(a.Create(context.Background(), archivePath)).IsNil()
+
+			genericFs, err := archives.FileSystem(context.Background(), archivePath, nil)
+			g.Assert(err).IsNil()
+			afs, ok := genericFs.(iofs.ReadDirFS)
+			g.Assert(ok).IsTrue()
+
+			files, err := getFiles(afs, ".")
+			g.Assert(err).IsNil()
+			g.Assert(files).Equal([]string{"server.jar"})
+		})
+
+		g.It("rejects an ignore list that exceeds the limits", func() {
+			r := strings.NewReader("hello, world!\n")
+			g.Assert(fs.Write("server.jar", r, r.Size(), 0o644)).IsNil()
+
+			a := &Archive{
+				Filesystem: fs,
+				Ignore:     strings.Repeat("*a", MaxIgnorePatternWildcards+1),
+			}
+
+			archivePath := filepath.Join(rfs.root, "archive.tar.gz")
+			g.Assert(a.Create(context.Background(), archivePath)).IsNotNil()
 		})
 	})
 }
